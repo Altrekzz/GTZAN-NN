@@ -1,0 +1,319 @@
+---
+title: "genre_classification"
+author: "Noah Ackert"
+date: "2025-11-25"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+Load Data & Libraries
+```{r, echo = FALSE, include = FALSE}
+library(tidyverse)
+library(dplyr)
+library(xgboost)
+library(caret)
+library(doParallel)
+library(randomForest)
+library(stats)
+library(reshape2)
+library(gridExtra)
+library(keras)
+library(tensorflow)
+library(reticulate)
+library(scales)
+library(ggrepel)
+
+use_virtualenv("r-tensorflow", required = TRUE)
+
+setwd("C:/Users/noaha/OneDrive/Desktop/Academic/JUNIOR/DATA MINING/final")
+data <- read.csv("GTZAN_features.csv")
+```
+
+Data Preprocessing 
+```{r, echo = FALSE, include = FALSE}
+#view(data)
+str(data)
+sum(is.na(data)) #no missing data!
+
+data$tempo <- gsub("\\[|\\]", "", data$tempo) #remove brackets from tempo var
+data$tempo <- as.numeric(data$tempo) #change to numeric
+data$genre <- as.factor(data$genre) #change to factor
+
+data2 <- data
+numeric_cols <- 1:33
+
+data2[, numeric_cols] <- scale(data[, numeric_cols]) # z score standardization
+
+```
+
+Train Test Split
+```{r, echo = FALSE}
+set.seed(1337)
+index <- createDataPartition(y = data2$genre, p = 0.7, list = FALSE) # 70 / 30 split
+data_train <- data2[index,]
+data_test <- data2[-index,]
+
+data_test$file_name <- NULL # remove file name for analysis
+data_train$file_name <- NULL
+```
+
+KNN
+```{r, echo = FALSE}
+cl <- makePSOCKcluster(detectCores() - 1) # detect # of cores and enable
+registerDoParallel(cl)                    # parallel processing for quicker training
+set.seed(1337)
+
+music_knn <- caret::train(
+  genre ~ .,
+  data = data_train,
+  method = "knn",
+  metric = "Accuracy",
+  trControl = trainControl(method = "cv", number = 5, allowParallel = TRUE),
+  tuneLength = 5)
+
+stopCluster(cl)
+registerDoSEQ() # end parallel processing
+```
+
+XGBoost
+```{r, echo = FALSE, include = FALSE}
+cl <- makePSOCKcluster(detectCores() - 1)
+registerDoParallel(cl)
+set.seed(1337)
+
+xgb_grid <- expand.grid( # tune grid to explore more parameters
+  nrounds = c(100, 200),
+  max_depth = c(4, 6),
+  eta = c(0.1, 0.2),
+  gamma = 0,
+  colsample_bytree = c(0.8, 1),
+  min_child_weight = 1,
+  subsample = c(0.8, 1))
+
+ctrl <- trainControl(
+  method = "cv",
+  number = 3,
+  verboseIter = TRUE)
+
+music_gb <- caret::train(
+  genre ~ ., 
+  data = data_train,
+  method = "xgbTree",
+  metric = "Accuracy",
+  trControl = ctrl,
+  tuneGrid = xgb_grid)
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+Random Forest
+```{r, echo = FALSE, include = FALSE}
+cl <- makePSOCKcluster(detectCores() - 1)
+registerDoParallel(cl)
+set.seed(1337)
+
+music_rf <- caret::train(
+  genre ~ ., 
+  data = data_train,
+  method = "rf",
+  metric = "Accuracy",
+  trControl = trainControl(
+    method = "cv",
+    number = 5,
+    verboseIter = TRUE),
+  tuneLength = 5)
+
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+Confusion Matrices
+```{r, echo = FALSE, include = FALSE}
+gb_pred <- predict(music_gb, data_test)
+confusionMatrix(gb_pred, data_test$genre)
+#accuracy 0.6589
+
+rf_pred <- predict(music_rf, data_test)
+confusionMatrix(rf_pred, data_test$genre)
+#accuracy 0.6087
+
+knn_pred <- predict(music_knn, data_test)
+confusionMatrix(knn_pred, data_test$genre)
+#accuracy 0.4247
+```
+
+Ensemble
+```{r, echo = FALSE, include = FALSE}
+rf_probs <- predict(music_rf, data_test, type = "prob")
+xgb_probs <- predict(music_gb, data_test, type = "prob")
+knn_probs <- predict(music_knn, data_test, type = "prob")
+
+ensemble_probs <- (rf_probs + xgb_probs + knn_probs) / 3 # weighs decisions of all models
+ensemble_pred <- colnames(ensemble_probs)[apply(ensemble_probs, 1, which.max)]
+ensemble_pred <- factor(ensemble_pred, levels = levels(data_test$genre))
+
+confusionMatrix(ensemble_pred, data_test$genre)
+
+#accuracy 0.6488
+```
+
+Visualizations
+```{r, echo = FALSE}
+gb_cm <- confusionMatrix(gb_pred, data_test$genre)
+cm_table <- as.data.frame(gb_cm$table)
+colnames(cm_table) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 4) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix for XGBoost",
+       x = "True Genre",
+       y = "Predicted Genre") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Dense Neural Network
+```{r, echo = FALSE, include = FALSE}
+x <- as.matrix(data2[, 1:33])
+y <- data2$genre 
+num_classes <- length(levels(y))
+
+set.seed(1337)
+
+index2 <- sample(1:nrow(data2), 0.8 * nrow(data2)) # try a different split
+x_train <- x[index2, ]
+x_val   <- x[-index2, ]
+
+y_train <- to_categorical(as.numeric(y[index2]) - 1, num_classes)
+y_val   <- to_categorical(as.numeric(y[-index2]) - 1, num_classes)
+
+nn_model <- keras_model_sequential() %>%
+  layer_dense(
+    units = 512, activation = "relu", # layer 1
+    input_shape = ncol(x_train),
+    kernel_regularizer = regularizer_l2(0.001)
+  ) %>%
+  layer_dropout(0.3) %>% # layer 2 (non trainable)
+  
+  layer_dense(
+    units = 256, activation = "relu",
+    kernel_regularizer = regularizer_l2(0.003) # layer 3
+  ) %>%
+  layer_dropout(0.3) %>% # layer 4 (non trainable)
+  
+  layer_dense(
+    units = 64, activation = "relu",
+    kernel_regularizer = regularizer_l2(0.01) # layer 5
+  ) %>%
+  layer_dropout(0.3) %>% # layer 6 (non trainable)
+  
+  layer_dense(units = 32, activation = "relu") %>% # layer 7
+  
+  layer_dense(units = num_classes, activation = "softmax") # layer 8
+
+nn_model %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.0005), #learning speed regularizes training across epochs
+  loss = "categorical_crossentropy",
+  metrics = "accuracy"
+)
+
+early_stop <- callback_early_stopping( # stop training early if validation
+  monitor = "val_loss",                # accuracy continually shrinks
+  patience = 10,
+  restore_best_weights = TRUE
+)
+
+history <- nn_model %>% fit( # fit the model, this is what takes most of the time
+  x_train, y_train,
+  validation_data = list(x_val, y_val),
+  epochs = 100,
+  batch_size = 32, # batch size allows model to change weights frequently without capturing noise
+  callbacks = list(early_stop),
+  verbose = 1,
+)
+
+```
+
+NN Predictions
+```{r, echo = FALSE}
+nn_pred_probs <- nn_model %>% predict(x_val)
+nn_pred_classes <- apply(nn_pred_probs, 1, which.max)
+nn_true_classes <- apply(y_val, 1, which.max)
+
+nn_cm <- confusionMatrix(
+  factor(nn_pred_classes),
+  factor(nn_true_classes),
+  dnn = c("Predicted", "Actual")
+)
+
+cm_table2 <- as.data.frame(nn_cm$table)
+colnames(cm_table2) <- c("Prediction", "Reference", "Freq")
+
+ggplot(cm_table2, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), color = "black", size = 4) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  theme_minimal() +
+  labs(title = "Confusion Matrix for Neural Network",
+       x = "True Genre",
+       y = "Predicted Genre") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+Accuracy over Epochs
+```{r, echo = FALSE}
+history_df <- data.frame(
+  epoch = 1:length(history$metrics$accuracy),
+  TrainAcc = history$metrics$accuracy,
+  ValAcc = history$metrics$val_accuracy
+)
+
+history_df_long <- tidyr::pivot_longer(history_df, cols = c(TrainAcc, ValAcc),
+                                       names_to = "Dataset", values_to = "Accuracy")
+
+ggplot(history_df_long, aes(x = epoch, y = Accuracy, color = Dataset)) +
+  geom_line(size = 1) +
+  geom_point(size = 1) +
+  scale_y_continuous(limits = c(0,1)) +
+  labs(title = "Training vs Validation Accuracy over Epochs", x = "Epoch", y = "Accuracy") +
+  theme_minimal()
+
+```
+
+
+Share of Correct Observations vs Share of Actual Observations
+```{r, echo = FALSE}
+cm_table2 <- cm_table2 %>%
+  mutate(Correct = ifelse(Prediction == Reference, Freq, 0))
+
+correct_per_class <- cm_table2 %>%
+  group_by(Reference) %>%
+  summarise(Correct = sum(Correct))
+
+correct_per_class <- correct_per_class %>%
+  mutate(CorrectShare = Correct / sum(Correct)) # only share of correct obs
+
+correct_per_class <- correct_per_class %>% 
+  mutate(Genre = c("Blues", "Classical",
+                   "Country", "Disco", 
+                   "Hip-Hop", "Jazz", 
+                   "Metal", "Pop", 
+                   "Reggae","Rock"))
+
+correct_per_class <- correct_per_class %>%
+  arrange(desc(Reference)) %>%
+  mutate(PercentText = percent(CorrectShare, accuracy = 0.01),
+    label_text = paste0(Genre, ": ", PercentText)) # add pct values to label for reference
+
+ggplot(correct_per_class, aes(x = 1, y = CorrectShare, fill = label_text)) +
+  geom_bar(stat = "identity", width = 1, color = "white") +
+  coord_polar("y", start = 0) +
+  labs(title = "Correct Genre Predictions Share", fill = "Genre") +
+  theme_void()
+```
+
+
